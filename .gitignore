@@ -2,7 +2,9 @@
 bin/
 obj/
 out/
-dist/
+dist/*
+!dist/NDI_Screenshare-*-setup.exe
+!dist/NDI_Screenshare-*-setup.exe.sha256
 *.user
 *.suo
 .vs/

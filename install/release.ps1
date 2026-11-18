@@ -89,8 +89,12 @@ git tag $tag
 git push origin $tag
 
 $releaseExists = $false
-gh release view $tag --repo Brisbane-ICT/NDI_Screenshare 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+  gh release view $tag --repo Brisbane-ICT/NDI_Screenshare 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+} finally { $ErrorActionPreference = $prevEap }
 
 if ($releaseExists -and -not $Force) {
   throw "Release $tag already exists. Re-run with -Force to re-upload assets."

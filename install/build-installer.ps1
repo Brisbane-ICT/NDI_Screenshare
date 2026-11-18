@@ -57,6 +57,8 @@ if (-not $SkipPublish) {
 $iscc = $null
 $candidates = @(
   (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+  "$env:ProgramFiles(x86)\Inno Setup 7\ISCC.exe",
+  "$env:ProgramFiles\Inno Setup 7\ISCC.exe",
   "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
   "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
@@ -67,6 +69,8 @@ if ($iscc) {
   & $iscc "/DMyAppVersion=$version" (Join-Path $PSScriptRoot 'ndi-screenshare.iss')
   if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
   Get-ChildItem $distDir -Filter "*$version*setup*.exe" | Format-Table Name, Length
+  $setup = Get-ChildItem $distDir -Filter "*$version*setup*.exe" | Select-Object -First 1
+  if ($setup) { "$( (Get-FileHash $setup.FullName -Algorithm SHA256).Hash )  $($setup.Name)" | Out-File "$($setup.FullName).sha256" -Encoding ascii }
   Write-Host 'Installer build done.'
   exit 0
 }

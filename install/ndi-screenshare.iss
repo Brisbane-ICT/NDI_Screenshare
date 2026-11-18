@@ -1,4 +1,4 @@
-; NDI Screenshare — Inno Setup 6 script
+; NDI Screenshare — Inno Setup script (v6 or later)
 ; AppVersion is injected at build time via /DMyAppVersion=<VERSION>
 ;   e.g. ISCC /DMyAppVersion=0.1.0 install\ndi-screenshare.iss
 ; Falls back to 0.0.0 when built without the define (dev only).
@@ -9,7 +9,7 @@
 #define MyAppName "NDI Screenshare"
 #define MyAppExe "NDI_Screenshare.exe"
 #define MyAppPublisher "NDI Screenshare"
-#define MyAppURL "https://github.com/"
+#define MyAppURL "https://github.com/Brisbane-ICT/NDI_Screenshare"
 #define NdiRuntimeURL "https://ndi.video/tools/ndi-core-suite/"
 
 [Setup]
@@ -26,7 +26,8 @@ OutputBaseFilename=NDI_Screenshare-{#MyAppVersion}-win64-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=admin
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExe}

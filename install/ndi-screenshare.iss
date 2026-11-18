@@ -60,10 +60,55 @@ Root: HKCU; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function NdiEnvFilePresent(): Boolean;
+var
+  Dir: String;
+begin
+  Result := False;
+  { Official discovery: NDI_RUNTIME_DIR_V* env vars each hold the dir directly. }
+  Dir := GetEnv('NDI_RUNTIME_DIR_V6');
+  if (Dir <> '') and FileExists(Dir + '\Processing.NDI.Lib.x64.dll') then begin Result := True; exit; end;
+  Dir := GetEnv('NDI_RUNTIME_DIR_V5');
+  if (Dir <> '') and FileExists(Dir + '\Processing.NDI.Lib.x64.dll') then begin Result := True; exit; end;
+  if (Dir <> '') and FileExists(Dir + '\ndi.dll') then begin Result := True; exit; end;
+  Dir := GetEnv('NDI_SDK_DIR');
+  if (Dir <> '') and FileExists(Dir + '\Bin\x64\Processing.NDI.Lib.x64.dll') then begin Result := True; exit; end;
+  if (Dir <> '') and FileExists(Dir + '\Bin\x64\ndi.dll') then begin Result := True; exit; end;
+end;
+
+function NdiUninstallLocationPresent(RootKey: Integer): Boolean;
+var
+  Subkeys: TArrayOfString;
+  Display, Location: String;
+  I: Integer;
+begin
+  Result := False;
+  if not RegGetSubkeyNames(RootKey, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', Subkeys) then exit;
+  for I := 0 to GetArrayLength(Subkeys) - 1 do
+  begin
+    Display := '';
+    Location := '';
+    RegQueryStringValue(RootKey,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' + Subkeys[I],
+      'DisplayName', Display);
+    { Match ANY NDI product so custom-drive / Tools / SDK layouts are found. }
+    if (Display = '') or (Pos('NDI', Uppercase(Display)) = 0) then continue;
+    RegQueryStringValue(RootKey,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' + Subkeys[I],
+      'InstallLocation', Location);
+    if Location = '' then continue;
+    if FileExists(Location + '\Processing.NDI.Lib.x64.dll') then begin Result := True; exit; end;
+    if FileExists(Location + '\ndi.dll') then begin Result := True; exit; end;
+  end;
+end;
+
 function NdiFilePresent(): Boolean;
 var
   Pf64, Pf32, AutoPf: String;
 begin
+  { Env vars first (covers custom paths / other drives), then well-known files,
+    then the Uninstall InstallLocation scan. }
+  if NdiEnvFilePresent() then begin Result := True; exit; end;
   { The app loads this exact DLL — file presence is the strongest signal. }
   Pf64 := ExpandConstant('{pf64}');
   Pf32 := ExpandConstant('{pf32}');
@@ -76,6 +121,8 @@ begin
     FileExists(Pf32 + '\NDI\NDI 6 Runtime\Processing.NDI.Lib.x64.dll') or
     FileExists(Pf64 + '\NewTek\NDI 5 Runtime\v5\ndi.dll') or
     FileExists(Pf32 + '\NewTek\NDI 5 Runtime\v5\ndi.dll');
+  if Result then exit;
+  Result := NdiUninstallLocationPresent(HKLM64) or NdiUninstallLocationPresent(HKLM32);
 end;
 
 function NdiRuntimeMissing(): Boolean;

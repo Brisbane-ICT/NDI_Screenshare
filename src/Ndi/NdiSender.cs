@@ -22,8 +22,9 @@ namespace NdiScreenshare.Ndi
     public sealed class NdiSender : IDisposable
     {
         // NDI 6 installs as Processing.NDI.Lib.x64.dll (not ndi.dll). Probe in order:
-        // 1) legacy NDI 5 name (PATH-resolved), 2) NDI 6 name (PATH-resolved),
-        // 3) well-known full paths + HKLM uninstall InstallLocation lookup.
+        // 1) NDI_RUNTIME_DIR_V6..V2 + NDI_SDK_DIR env vars, 2) bare names via PATH,
+        // 3) HKLM Uninstall scan (64/32 views, any DisplayName containing 'NDI'),
+        // 4) %ProgramFiles%\NDI (+ x86) depth-3 match, 5) legacy hardcoded paths.
         private const string NdiLegacyDllName = "ndi.dll";
         private const string NdiLibFileName = "Processing.NDI.Lib.x64.dll";
         private const string Ndi6RuntimePath = @"C:\Program Files\NDI\NDI 6 Runtime\v6\Processing.NDI.Lib.x64.dll";
@@ -114,6 +115,8 @@ namespace NdiScreenshare.Ndi
 
         // ---- Diagnostics state (for GetDiagnostics + file log) ----
         private static string s_loadedPath;
+        private static string s_loadedSource = "none";
+        private static int s_probeSearched;
         private static int s_lastLoadError;
         private static readonly List<string> s_procsOk = new List<string>();
         private static readonly List<string> s_procsMissing = new List<string>();
@@ -165,6 +168,7 @@ namespace NdiScreenshare.Ndi
                 return "loadedDll=" + dll + " procs_ok=[" + ok + "] procs_missing=[" + missing
                     + "] init=" + s_initResult + " send_create=" + s_sendCreateResult
                     + " ndi_version=" + ver + " lastError=" + s_lastLoadError
+                    + " searched=" + s_probeSearched + " source=" + s_loadedSource
                     + " x64=" + Environment.Is64BitProcess + " ptrSize=" + IntPtr.Size;
             }
             catch
@@ -585,8 +589,15 @@ namespace NdiScreenshare.Ndi
                             + " (need x64 process for Processing.NDI.Lib.x64.dll).");
                     }
 
-                    foreach (string candidate in BuildProbeList())
+                    List<KeyValuePair<string, string>> probes = BuildProbeList();
+                    s_probeSearched = probes.Count;
+                    NdiLog("INFO", "Probe list built: searched=" + probes.Count
+                        + " order=env:N > path:2 > registry:N > programfiles:N > hardcoded:2.");
+
+                    foreach (KeyValuePair<string, string> probe in probes)
                     {
+                        string candidate = probe.Key;
+                        string source = probe.Value;
                         bool exists = false;
                         try { exists = !string.IsNullOrEmpty(candidate) && File.Exists(candidate); }
                         catch { exists = false; }
@@ -597,21 +608,22 @@ namespace NdiScreenshare.Ndi
                             {
                                 s_module = module;
                                 s_loadedPath = candidate;
+                                s_loadedSource = source;
                                 s_lastLoadError = 0;
-                                NdiLog("INFO", "probe OK: LoadLibrary('" + candidate + "') succeeded handle=0x"
+                                NdiLog("INFO", "probe OK [" + source + "]: LoadLibrary('" + candidate + "') succeeded handle=0x"
                                     + module.ToString("X") + " fileExists=" + exists + ".");
                                 break;
                             }
 
                             int err = Marshal.GetLastWin32Error();
                             s_lastLoadError = err;
-                            NdiLog("WARN", "probe FAIL: LoadLibrary('" + candidate + "') returned NULL"
+                            NdiLog("WARN", "probe FAIL [" + source + "]: LoadLibrary('" + candidate + "') returned NULL"
                                 + " GetLastError=" + err + " (" + DescribeLoadError(err) + ")"
                                 + " fileExists=" + exists + ".");
                         }
                         catch (Exception ex)
                         {
-                            NdiLog("WARN", "probe EX: LoadLibrary('" + candidate + "') threw "
+                            NdiLog("WARN", "probe EX [" + source + "]: LoadLibrary('" + candidate + "') threw "
                                 + ex.GetType().Name + ": " + ex.Message);
                         }
                     }
@@ -633,159 +645,421 @@ namespace NdiScreenshare.Ndi
             }
         }
 
-        private static string[] BuildProbeList()
+        private static readonly string[] NdiFileNames = { NdiLibFileName, NdiLegacyDllName };
+
+        private static readonly string[] NdiRuntimeEnvVars =
         {
-            // Registry-derived path goes last (bonus fallback); PATH names first.
-            string registryPath = null;
-            try
-            {
-                registryPath = GetNdiRuntimePathFromRegistry();
-                NdiLog("INFO", "registry probe: " + (string.IsNullOrWhiteSpace(registryPath) ? "(none found)" : registryPath));
-            }
-            catch (Exception ex)
-            {
-                NdiLog("WARN", "Registry probe failed: " + ex.GetType().Name + ": " + ex.Message);
-            }
+            "NDI_RUNTIME_DIR_V6",
+            "NDI_RUNTIME_DIR_V5",
+            "NDI_RUNTIME_DIR_V4",
+            "NDI_RUNTIME_DIR_V3",
+            "NDI_RUNTIME_DIR_V2",
+        };
 
-            if (string.IsNullOrWhiteSpace(registryPath))
-            {
-                return new[]
-                {
-                    NdiLegacyDllName,
-                    NdiLibFileName,
-                    Ndi6RuntimePath,
-                    Ndi6SdkPath,
-                };
-            }
-
-            return new[]
-            {
-                NdiLegacyDllName,
-                NdiLibFileName,
-                Ndi6RuntimePath,
-                Ndi6SdkPath,
-                registryPath,
-            };
-        }
+        private static List<string> s_programFilesCache;
+        private static bool s_programFilesScanned;
 
         /// <summary>
-        /// Bonus fallback: HKLM uninstall entry for "NDI 6 Runtime" ->
-        /// InstallLocation (dir + Processing.NDI.Lib.x64.dll) or DisplayIcon file.
-        /// Returns null when not found. Never throws.
+        /// Ordered probe list (each entry tagged with its source for diagnostics):
+        /// 1) NDI_RUNTIME_DIR_V6..V2 env dirs (+ NDI_SDK_DIR\Bin\x64),
+        /// 2) bare names via PATH, 3) registry Uninstall scan (64/32 views, any
+        /// DisplayName containing 'NDI'), 4) %ProgramFiles%\NDI (+ x86) depth-3
+        /// filename match, 5) legacy hardcoded C:\Program Files paths. Never throws.
         /// </summary>
-        private static string GetNdiRuntimePathFromRegistry()
+        private static List<KeyValuePair<string, string>> BuildProbeList()
         {
+            List<KeyValuePair<string, string>> probes = new List<KeyValuePair<string, string>>();
             try
             {
-                using (RegistryKey uninstall = Registry.LocalMachine.OpenSubKey(
-                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+                // 1) Official discovery: NDI_RUNTIME_DIR_V* env vars (each holds the dir directly).
+                foreach (string envName in NdiRuntimeEnvVars)
                 {
-                    if (uninstall == null)
+                    string dir = null;
+                    try { dir = Environment.GetEnvironmentVariable(envName); }
+                    catch (Exception ex)
                     {
-                        return null;
+                        NdiLog("WARN", "env probe: GetEnvironmentVariable('" + envName + "') failed: "
+                            + ex.GetType().Name + ": " + ex.Message);
+                        continue;
                     }
 
-                    foreach (string subName in uninstall.GetSubKeyNames())
+                    if (string.IsNullOrWhiteSpace(dir))
+                    {
+                        continue;
+                    }
+
+                    dir = dir.Trim().Trim('"');
+                    foreach (string file in NdiFileNames)
                     {
                         try
                         {
-                            using (RegistryKey sub = uninstall.OpenSubKey(subName))
-                            {
-                                if (sub == null)
-                                {
-                                    continue;
-                                }
-
-                                string display = sub.GetValue("DisplayName") as string;
-                                if (string.IsNullOrWhiteSpace(display)
-                                    || display.IndexOf("NDI", StringComparison.OrdinalIgnoreCase) < 0
-                                    || display.IndexOf("Runtime", StringComparison.OrdinalIgnoreCase) < 0)
-                                {
-                                    continue;
-                                }
-
-                                string location = sub.GetValue("InstallLocation") as string;
-                                if (!string.IsNullOrWhiteSpace(location))
-                                {
-                                    location = location.Trim().Trim('"');
-                                    try
-                                    {
-                                        if (File.Exists(location)
-                                            && string.Equals(Path.GetFileName(location), NdiLibFileName, StringComparison.OrdinalIgnoreCase))
-                                        {
-                                            return location;
-                                        }
-
-                                        string combined = Path.Combine(location, NdiLibFileName);
-                                        if (File.Exists(combined))
-                                        {
-                                            return combined;
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        NdiLog("WARN", "InstallLocation probe failed: " + ex.GetType().Name + ": " + ex.Message);
-                                    }
-                                }
-
-                                string icon = sub.GetValue("DisplayIcon") as string;
-                                if (!string.IsNullOrWhiteSpace(icon))
-                                {
-                                    string file = icon.Trim().Trim('"');
-                                    int comma = file.IndexOf(",\"", StringComparison.Ordinal);
-                                    if (comma >= 0)
-                                    {
-                                        file = file.Substring(0, comma).Trim().Trim('"');
-                                    }
-                                    else
-                                    {
-                                        int lastComma = file.LastIndexOf(',');
-                                        if (lastComma > 1 && file.Length - lastComma <= 4)
-                                        {
-                                            file = file.Substring(0, lastComma).Trim().Trim('"');
-                                        }
-                                    }
-
-                                    try
-                                    {
-                                        if (File.Exists(file))
-                                        {
-                                            if (string.Equals(Path.GetFileName(file), NdiLibFileName, StringComparison.OrdinalIgnoreCase))
-                                            {
-                                                return file;
-                                            }
-
-                                            string dir = Path.GetDirectoryName(file);
-                                            if (!string.IsNullOrWhiteSpace(dir))
-                                            {
-                                                string combined = Path.Combine(dir, NdiLibFileName);
-                                                if (File.Exists(combined))
-                                                {
-                                                    return combined;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        NdiLog("WARN", "DisplayIcon probe failed: " + ex.GetType().Name + ": " + ex.Message);
-                                    }
-                                }
-                            }
+                            string full = Path.Combine(dir, file);
+                            probes.Add(new KeyValuePair<string, string>(full, "env:" + envName));
+                            NdiLog("INFO", "env probe: " + envName + "='" + dir + "' -> '" + full + "'.");
                         }
                         catch (Exception ex)
                         {
-                            NdiLog("WARN", "Registry subkey probe failed: " + ex.GetType().Name + ": " + ex.Message);
+                            NdiLog("WARN", "env probe combine failed: " + ex.GetType().Name + ": " + ex.Message);
                         }
+                    }
+                }
+
+                // 1b) NDI_SDK_DIR -> %NDI_SDK_DIR%\Bin\x64\<both names>.
+                string sdkDir = null;
+                try { sdkDir = Environment.GetEnvironmentVariable("NDI_SDK_DIR"); }
+                catch (Exception ex)
+                {
+                    NdiLog("WARN", "env probe: GetEnvironmentVariable('NDI_SDK_DIR') failed: "
+                        + ex.GetType().Name + ": " + ex.Message);
+                }
+
+                if (!string.IsNullOrWhiteSpace(sdkDir))
+                {
+                    sdkDir = sdkDir.Trim().Trim('"');
+                    string binX64 = null;
+                    try { binX64 = Path.Combine(sdkDir, "Bin", "x64"); }
+                    catch (Exception ex)
+                    {
+                        NdiLog("WARN", "env probe NDI_SDK_DIR combine failed: " + ex.GetType().Name + ": " + ex.Message);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(binX64))
+                    {
+                        foreach (string file in NdiFileNames)
+                        {
+                            try
+                            {
+                                string full = Path.Combine(binX64, file);
+                                probes.Add(new KeyValuePair<string, string>(full, "env:NDI_SDK_DIR"));
+                                NdiLog("INFO", "env probe: NDI_SDK_DIR='" + sdkDir + "' -> '" + full + "'.");
+                            }
+                            catch (Exception ex)
+                            {
+                                NdiLog("WARN", "env probe combine failed: " + ex.GetType().Name + ": " + ex.Message);
+                            }
+                        }
+                    }
+                }
+
+                // 2) Bare names via PATH.
+                probes.Add(new KeyValuePair<string, string>(NdiLibFileName, "path"));
+                probes.Add(new KeyValuePair<string, string>(NdiLegacyDllName, "path"));
+
+                // 3) Registry scan: ANY Uninstall subkey whose DisplayName contains 'NDI'
+                // (both 64- and 32-bit views) -> <InstallLocation>\<both names>.
+                List<KeyValuePair<string, string>> registryProbes = GetNdiPathsFromRegistry();
+                probes.AddRange(registryProbes);
+                NdiLog("INFO", "registry probe: found " + registryProbes.Count + " candidate(s).");
+
+                // 4) %ProgramFiles%\NDI and %ProgramFiles(x86)%\NDI, bounded depth-3
+                // filename match for the two known names (fast, cached).
+                List<KeyValuePair<string, string>> pfProbes = GetProgramFilesNdiProbes();
+                probes.AddRange(pfProbes);
+                NdiLog("INFO", "programfiles probe: found " + pfProbes.Count + " candidate(s).");
+
+                // 5) Legacy hardcoded fallbacks (kept last).
+                probes.Add(new KeyValuePair<string, string>(Ndi6RuntimePath, "hardcoded"));
+                probes.Add(new KeyValuePair<string, string>(Ndi6SdkPath, "hardcoded"));
+            }
+            catch (Exception ex)
+            {
+                NdiLog("WARN", "BuildProbeList failed: " + ex.GetType().Name + ": " + ex.Message);
+                try
+                {
+                    probes.Add(new KeyValuePair<string, string>(NdiLibFileName, "path"));
+                    probes.Add(new KeyValuePair<string, string>(NdiLegacyDllName, "path"));
+                    probes.Add(new KeyValuePair<string, string>(Ndi6RuntimePath, "hardcoded"));
+                    probes.Add(new KeyValuePair<string, string>(Ndi6SdkPath, "hardcoded"));
+                }
+                catch
+                {
+                    // Never throw.
+                }
+            }
+
+            return probes;
+        }
+
+        /// <summary>
+        /// Scans HKLM Uninstall (64- and 32-bit views) for ANY subkey whose
+        /// DisplayName contains 'NDI' and returns
+        /// &lt;InstallLocation&gt;\&lt;both names&gt;. Never throws.
+        /// </summary>
+        private static List<KeyValuePair<string, string>> GetNdiPathsFromRegistry()
+        {
+            List<KeyValuePair<string, string>> found = new List<KeyValuePair<string, string>>();
+            RegistryView[] views = { RegistryView.Registry64, RegistryView.Registry32 };
+            foreach (RegistryView view in views)
+            {
+                string viewLabel = view == RegistryView.Registry64 ? "64" : "32";
+                try
+                {
+                    using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view))
+                    using (RegistryKey uninstall = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+                    {
+                        if (uninstall == null)
+                        {
+                            NdiLog("INFO", "registry probe [" + viewLabel + "]: Uninstall key missing.");
+                            continue;
+                        }
+
+                        string[] subNames;
+                        try
+                        {
+                            subNames = uninstall.GetSubKeyNames();
+                        }
+                        catch (Exception ex)
+                        {
+                            NdiLog("WARN", "registry probe [" + viewLabel + "]: GetSubKeyNames failed: "
+                                + ex.GetType().Name + ": " + ex.Message);
+                            continue;
+                        }
+
+                        foreach (string subName in subNames)
+                        {
+                            try
+                            {
+                                using (RegistryKey sub = uninstall.OpenSubKey(subName))
+                                {
+                                    if (sub == null)
+                                    {
+                                        continue;
+                                    }
+
+                                    string display = null;
+                                    string location = null;
+                                    try
+                                    {
+                                        display = sub.GetValue("DisplayName") as string;
+                                        location = sub.GetValue("InstallLocation") as string;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        NdiLog("WARN", "registry probe [" + viewLabel + "/" + subName + "] read failed: "
+                                            + ex.GetType().Name + ": " + ex.Message);
+                                        continue;
+                                    }
+
+                                    if (string.IsNullOrWhiteSpace(display)
+                                        || display.IndexOf("NDI", StringComparison.OrdinalIgnoreCase) < 0)
+                                    {
+                                        continue;
+                                    }
+
+                                    NdiLog("INFO", "registry probe [" + viewLabel + "]: match DisplayName='"
+                                        + display + "' InstallLocation='" + (location ?? "(null)") + "'.");
+
+                                    if (string.IsNullOrWhiteSpace(location))
+                                    {
+                                        continue;
+                                    }
+
+                                    location = location.Trim().Trim('"');
+                                    foreach (string file in NdiFileNames)
+                                    {
+                                        try
+                                        {
+                                            string combined;
+                                            if (string.Equals(Path.GetFileName(location), file, StringComparison.OrdinalIgnoreCase)
+                                                && File.Exists(location))
+                                            {
+                                                combined = location;
+                                            }
+                                            else
+                                            {
+                                                combined = Path.Combine(location, file);
+                                            }
+
+                                            found.Add(new KeyValuePair<string, string>(
+                                                combined, "registry:" + viewLabel));
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            NdiLog("WARN", "registry probe combine failed: "
+                                                + ex.GetType().Name + ": " + ex.Message);
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                NdiLog("WARN", "Registry subkey probe failed: " + ex.GetType().Name + ": " + ex.Message);
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    NdiLog("WARN", "Registry lookup [" + viewLabel + "] failed: " + ex.GetType().Name + ": " + ex.Message);
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// Bounded (depth-3) filename match under %ProgramFiles%\NDI and
+        /// %ProgramFiles(x86)%\NDI for the two known DLL names. Cached. Never throws.
+        /// </summary>
+        private static List<KeyValuePair<string, string>> GetProgramFilesNdiProbes()
+        {
+            List<KeyValuePair<string, string>> probes = new List<KeyValuePair<string, string>>();
+            try
+            {
+                if (s_programFilesScanned && s_programFilesCache != null)
+                {
+                    foreach (string cached in s_programFilesCache)
+                    {
+                        probes.Add(new KeyValuePair<string, string>(cached, "programfiles"));
+                    }
+
+                    return probes;
+                }
+
+                List<string> roots = new List<string>();
+                try
+                {
+                    string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                    string pfX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+                    if (!string.IsNullOrWhiteSpace(pf))
+                    {
+                        roots.Add(Path.Combine(pf, "NDI"));
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(pfX86))
+                    {
+                        string x86Ndi = Path.Combine(pfX86, "NDI");
+                        bool dup = false;
+                        foreach (string r in roots)
+                        {
+                            if (string.Equals(r, x86Ndi, StringComparison.OrdinalIgnoreCase))
+                            {
+                                dup = true;
+                                break;
+                            }
+                        }
+
+                        if (!dup)
+                        {
+                            roots.Add(x86Ndi);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    NdiLog("WARN", "programfiles probe: SpecialFolder lookup failed: "
+                        + ex.GetType().Name + ": " + ex.Message);
+                }
+
+                List<string> matches = new List<string>();
+                foreach (string root in roots)
+                {
+                    try
+                    {
+                        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+                        {
+                            NdiLog("INFO", "programfiles probe: root missing '" + (root ?? "(null)") + "'.");
+                            continue;
+                        }
+
+                        foreach (string match in ScanDirectoryBounded(root, 3))
+                        {
+                            matches.Add(match);
+                            probes.Add(new KeyValuePair<string, string>(match, "programfiles"));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        NdiLog("WARN", "programfiles probe root '" + root + "' failed: "
+                            + ex.GetType().Name + ": " + ex.Message);
+                    }
+                }
+
+                s_programFilesCache = matches;
+                s_programFilesScanned = true;
+            }
+            catch (Exception ex)
+            {
+                NdiLog("WARN", "programfiles probe failed: " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            return probes;
+        }
+
+        private static List<string> ScanDirectoryBounded(string root, int maxDepth)
+        {
+            List<string> matches = new List<string>();
+            try
+            {
+                List<string> current = new List<string>() { root };
+                for (int depth = 0; depth <= maxDepth; depth++)
+                {
+                    List<string> next = new List<string>();
+                    foreach (string dir in current)
+                    {
+                        string[] files = null;
+                        try { files = Directory.GetFiles(dir, "*.dll"); }
+                        catch (Exception ex)
+                        {
+                            NdiLog("WARN", "programfiles probe: GetFiles('" + dir + "') failed: "
+                                + ex.GetType().Name + ": " + ex.Message);
+                            continue;
+                        }
+
+                        foreach (string file in files)
+                        {
+                            try
+                            {
+                                string name = Path.GetFileName(file);
+                                foreach (string want in NdiFileNames)
+                                {
+                                    if (string.Equals(name, want, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        matches.Add(file);
+                                        NdiLog("INFO", "programfiles probe: match '" + file + "'.");
+                                        break;
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                NdiLog("WARN", "programfiles probe file check failed: "
+                                    + ex.GetType().Name + ": " + ex.Message);
+                            }
+                        }
+
+                        if (depth < maxDepth)
+                        {
+                            try
+                            {
+                                string[] subdirs = Directory.GetDirectories(dir);
+                                foreach (string sub in subdirs)
+                                {
+                                    next.Add(sub);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                NdiLog("WARN", "programfiles probe: GetDirectories('" + dir + "') failed: "
+                                    + ex.GetType().Name + ": " + ex.Message);
+                            }
+                        }
+                    }
+
+                    current = next;
+                    if (current.Count == 0)
+                    {
+                        break;
                     }
                 }
             }
             catch (Exception ex)
             {
-                NdiLog("WARN", "Registry lookup failed: " + ex.GetType().Name + ": " + ex.Message);
+                NdiLog("WARN", "programfiles scan failed: " + ex.GetType().Name + ": " + ex.Message);
             }
 
-            return null;
+            return matches;
         }
 
         private static bool EnsureDelegates()

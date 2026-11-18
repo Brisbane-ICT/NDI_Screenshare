@@ -28,6 +28,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Releases must use the operator's own stored GitHub login: an injected
+# GH_TOKEN/GITHUB_TOKEN (e.g. from automation) may not have org access.
+Remove-Item Env:\GH_TOKEN -ErrorAction SilentlyContinue
+Remove-Item Env:\GITHUB_TOKEN -ErrorAction SilentlyContinue
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 

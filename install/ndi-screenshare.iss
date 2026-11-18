@@ -60,13 +60,33 @@ Root: HKCU; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-function NdiRuntimeMissing(): Boolean;
+function NdiFilePresent(): Boolean;
 var
-  Key: String;
+  Pf64, Pf32, AutoPf: String;
 begin
-  { NDI 6 runtime registers under NewTek/NDI. Absence => warn, don't block. }
-  Key := 'SOFTWARE\NewTek\NDI';
-  Result := not RegKeyExists(HKLM64, Key) and not RegKeyExists(HKLM32, Key);
+  { The app loads this exact DLL — file presence is the strongest signal. }
+  Pf64 := ExpandConstant('{pf64}');
+  Pf32 := ExpandConstant('{pf32}');
+  AutoPf := ExpandConstant('{autopf}');
+  Result :=
+    FileExists(Pf64 + '\NDI\NDI 6 Runtime\v6\Processing.NDI.Lib.x64.dll') or
+    FileExists(Pf32 + '\NDI\NDI 6 Runtime\v6\Processing.NDI.Lib.x64.dll') or
+    FileExists(AutoPf + '\NDI\NDI 6 Runtime\v6\Processing.NDI.Lib.x64.dll') or
+    FileExists(Pf64 + '\NDI\NDI 6 Runtime\Processing.NDI.Lib.x64.dll') or
+    FileExists(Pf32 + '\NDI\NDI 6 Runtime\Processing.NDI.Lib.x64.dll') or
+    FileExists(Pf64 + '\NewTek\NDI 5 Runtime\v5\ndi.dll') or
+    FileExists(Pf32 + '\NewTek\NDI 5 Runtime\v5\ndi.dll');
+end;
+
+function NdiRuntimeMissing(): Boolean;
+begin
+  { NDI 6 registers HKLM\SOFTWARE\NDI (and no longer uses NewTek\NDI).
+    Warn only when neither the registry markers nor the runtime DLL exist. }
+  Result := not (
+    NdiFilePresent() or
+    RegKeyExists(HKLM64, 'SOFTWARE\NDI') or
+    RegKeyExists(HKLM64, 'SOFTWARE\NewTek\NDI') or
+    RegKeyExists(HKLM32, 'SOFTWARE\NewTek\NDI'));
 end;
 
 function InitializeSetup(): Boolean;
@@ -74,6 +94,8 @@ var
   Answer: Integer;
 begin
   Result := True;
+  { Silent installs must never block on a message box. }
+  if WizardSilent() then exit;
   if NdiRuntimeMissing() then
   begin
     Answer := MsgBox(

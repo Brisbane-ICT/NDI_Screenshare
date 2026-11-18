@@ -1,0 +1,18 @@
+NDI Screenshare — License / Prerequisite Note
+=============================================
+
+This software is provided as-is for sending your screen over NDI.
+
+PREREQUISITE: NDI Runtime 6 (free)
+-------------------------------
+NDI Screenshare requires the free NDI Runtime 6 to send video.
+If you do not already have an NDI SDK / runtime or NDI Tools installed,
+download NDI (free) here:
+
+  https://ndi.video/tools/ndi-core-suite/
+
+Install the NDI runtime first (or accept the prompt during setup),
+then install / run NDI Screenshare.
+
+NDI is a trademark of Vizrt / NDI. This project is not affiliated
+with or endorsed by Vizrt / NDI.

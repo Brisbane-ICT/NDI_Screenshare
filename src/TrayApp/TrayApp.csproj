@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <RootNamespace>NdiScreenshare</RootNamespace>
+    <AssemblyName>NDI_Screenshare</AssemblyName>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.DXGI" Version="3.5.0" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.5.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Infra\**\*.cs" Link="Infra\%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="..\Capture\**\*.cs" Link="Capture\%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="..\Ndi\**\*.cs" Link="Ndi\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

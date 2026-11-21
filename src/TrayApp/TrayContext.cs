@@ -38,6 +38,35 @@ public sealed class TrayContext : ApplicationContext
     private DesktopDuplicator? _dup;
     private NdiSender? _sender;
 
+    // In-process never-stop: heartbeat file (for the out-of-process supervisor),
+    // retry timer (restarts a dead pipeline forever with backoff), and throttled
+    // logging state for the capture/send loops. No exit path on streaming errors.
+    private Heartbeat? _heartbeat;
+    private System.Threading.Timer? _retryTimer;
+    private long _lastStartAttemptTick;
+    private int _startBackoffMs = 5000;
+    private long _lastRetryLogTick;
+    private long _lastCaptureErrorLogTick;
+    private int _captureErrorCount;
+    private long _lastSendErrorLogTick;
+    private int _sendErrorCount;
+    private volatile bool _quit;
+
+    // In-process watcher thread (ticks every 2s): verifies frames are actually
+    // flowing and workers are alive (see WatcherLoop). Counters below are written
+    // by the capture/send loops and read by the watcher.
+    private Thread? _watcherThread;
+    private long _framesSent;
+    private long _lastSendTick;
+    private long _lastCaptureTick;
+    private long _capIterations;
+    private long _pipelineStartTick;
+    private int _capErrors;   // consecutive capture-loop errors (reset on success)
+    private int _sendErrors;  // consecutive send-loop errors (reset on success)
+    private long _lastWatcherRebuildTick;
+    private int _watcherBackoffMs = 10000;
+    private long _lastWatcherLogTick;
+
     // Status/reporting (written on UI thread; fps counters written on send thread).
     private volatile int _measuredFps;
     private int _fpsCounter, _fpsWindowTick;
@@ -98,6 +127,14 @@ public sealed class TrayContext : ApplicationContext
         RebuildDisplays();
         Autostart.SetEnabled(_cfg.AutoStart);
         SyncMenu();
+        // Heartbeat for the out-of-process supervisor (check-heartbeat.ps1):
+        // written every 2s; a stale file means this process is hung.
+        _heartbeat = new Heartbeat();
+        _heartbeat.Start();
+        // In-process supervisor: if streaming is wanted but the pipeline is not
+        // alive (NDI init failed, capture blew up, ...), retry Start() forever
+        // with backoff instead of exiting or sitting dead.
+        _retryTimer = new System.Threading.Timer(_ => EnsureRunning(), null, 5000, 5000);
         if (_cfg.Running) Start(); else Notify("Paused. Use tray menu to start.");
     }
 
@@ -268,9 +305,19 @@ public sealed class TrayContext : ApplicationContext
 
     private void Start()
     {
-        if (_capThread?.IsAlive == true) return;
+        // Fully up already: nothing to do (lets the retry timer and menu call freely).
+        if (_capThread?.IsAlive == true && _sendThread?.IsAlive == true && _watcherThread?.IsAlive == true) return;
+        // Partial failure (e.g. a worker died but the rest is up): tear down fully
+        // first so worker threads are never duplicated, then rebuild fresh below.
+        try { Stop(); } catch (Exception ex) { Logger.Error(ex, "StartStop"); }
         _stop = false;
         _errorReason = null;
+        // Baselines for the watcher thread (ticks every 2s, 10s start-up grace).
+        _pipelineStartTick = Environment.TickCount64;
+        _lastSendTick = _pipelineStartTick;
+        _lastCaptureTick = _pipelineStartTick;
+        _capErrors = 0;
+        _sendErrors = 0;
         try
         {
             _sender?.Dispose();
@@ -286,8 +333,10 @@ public sealed class TrayContext : ApplicationContext
         _measuredFps = 0; _fpsCounter = 0; _fpsWindowTick = Environment.TickCount;
         _capThread = new Thread(CaptureLoop) { IsBackground = true, Name = "capture" };
         _sendThread = new Thread(SendLoop) { IsBackground = true, Name = "send" };
+        _watcherThread = new Thread(WatcherLoop) { IsBackground = true, Name = "watcher" };
         _capThread.Start();
         _sendThread.Start();
+        _watcherThread.Start();
         Logger.Info($"Started: display='{_cfg.DisplayDeviceName}' fps={_cfg.Fps} scale={_cfg.Scale}");
         SyncMenu();
     }
@@ -295,10 +344,13 @@ public sealed class TrayContext : ApplicationContext
     private void Stop()
     {
         _stop = true;
-        var cap = _capThread; var snd = _sendThread;
-        if (cap != null && cap != Thread.CurrentThread) cap.Join(2000);
-        if (snd != null && snd != Thread.CurrentThread) snd.Join(2000);
-        _capThread = null; _sendThread = null;
+        var cap = _capThread; var snd = _sendThread; var watch = _watcherThread;
+        if (cap != null && cap != Thread.CurrentThread && !cap.Join(2000))
+            Logger.Warn("Stop: capture thread did not exit in 2s (may be blocked in a native call).");
+        if (snd != null && snd != Thread.CurrentThread && !snd.Join(2000))
+            Logger.Warn("Stop: send thread did not exit in 2s (may be blocked in a native call).");
+        if (watch != null && watch != Thread.CurrentThread) watch.Join(2000);
+        _capThread = null; _sendThread = null; _watcherThread = null;
         try { _dup?.Dispose(); } catch { } _dup = null;
         try { _sender?.Dispose(); } catch { } _sender = null;
         _watchdog?.Dispose(); _watchdog = null;
@@ -322,6 +374,280 @@ public sealed class TrayContext : ApplicationContext
         RestartPipeline();
     }
 
+    /// <summary>
+    /// In-process supervisor (runs on a 5s timer): if streaming is wanted but the
+    /// pipeline is not alive, retry Start() forever with exponential backoff
+    /// (5s..60s). Never throws, never exits the process; repeated failures are
+    /// logged at most once per 30s so app.log is not flooded.
+    /// </summary>
+    private void EnsureRunning()
+    {
+        try
+        {
+            if (_quit || !_cfg.Running)
+            {
+                return;
+            }
+
+            // The watcher thread is part of the pipeline: if it died but the loops
+            // are up, Start() (called below) restarts the missing piece.
+            bool alive = _capThread?.IsAlive == true && _sendThread?.IsAlive == true
+                && _watcherThread?.IsAlive == true;
+            if (alive)
+            {
+                _startBackoffMs = 5000;
+                return;
+            }
+
+            long now = Environment.TickCount64;
+            if (now - _lastStartAttemptTick < _startBackoffMs)
+            {
+                return;
+            }
+
+            _lastStartAttemptTick = now;
+            try
+            {
+                Start();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error(ex, "EnsureRunning");
+            }
+
+            bool relit = _capThread?.IsAlive == true && _sendThread?.IsAlive == true
+                && _watcherThread?.IsAlive == true;
+            if (relit)
+            {
+                _startBackoffMs = 5000;
+                Logger.Info("Pipeline recovered by in-process supervisor.");
+            }
+            else
+            {
+                _startBackoffMs = Math.Min(_startBackoffMs * 2, 60000);
+                if (now - _lastRetryLogTick >= 30000)
+                {
+                    _lastRetryLogTick = now;
+                    Logger.Warn("Pipeline still down; will keep retrying (backoff "
+                        + (_startBackoffMs / 1000) + "s). reason=" + (_errorReason ?? "unknown"));
+                }
+            }
+            SyncMenu();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "EnsureRunning");
+        }
+    }
+
+    /// <summary>
+    /// In-process watcher thread: ticks every 2s and verifies frames are actually
+    /// flowing (frames-sent counter advancing, capture/send beats fresh) and that
+    /// no worker is deadlocked or error-looping. On stall, repeated errors, or a
+    /// dead worker it tears down and rebuilds the duplicator + sender from current
+    /// config with backoff (10s doubling to 60s), logging every action.
+    /// NOTE: this watcher lives inside the process, so it cannot survive a native
+    /// access violation inside Processing.NDI.Lib.x64.dll — the whole process dies
+    /// instantly and uncatchably. The out-of-process safety net for that case is
+    /// the per-user "NDI Screenshare" scheduled task (logon trigger + restart on
+    /// failure every 1 minute) plus the "NDI Screenshare Heartbeat" hang watchdog
+    /// (install/setup-supervisor.ps1 + install/check-heartbeat.ps1).
+    /// </summary>
+    private void WatcherLoop()
+    {
+        long lastFrames = Interlocked.Read(ref _framesSent);
+        long lastIter = Interlocked.Read(ref _capIterations);
+        while (!_stop)
+        {
+            // 2s tick in short slices so Stop()/Quit() stays responsive.
+            for (int i = 0; i < 10 && !_stop; i++) Thread.Sleep(200);
+            if (_stop) return;
+
+            try
+            {
+                if (_quit || !_cfg.Running)
+                {
+                    lastFrames = Interlocked.Read(ref _framesSent);
+                    lastIter = Interlocked.Read(ref _capIterations);
+                    continue;
+                }
+
+                string? problem = DetectPipelineProblem(ref lastFrames, ref lastIter);
+                if (problem == null)
+                {
+                    _watcherBackoffMs = 10000;
+                    continue;
+                }
+
+                long now = Environment.TickCount64;
+                if (now - _lastWatcherRebuildTick < _watcherBackoffMs)
+                {
+                    if (now - _lastWatcherLogTick >= 30000)
+                    {
+                        _lastWatcherLogTick = now;
+                        Logger.Warn("Watcher: pipeline problem persists (" + problem
+                            + "); backing off " + (_watcherBackoffMs / 1000)
+                            + "s before next rebuild.");
+                    }
+                    continue;
+                }
+
+                _lastWatcherRebuildTick = now;
+                _watcherBackoffMs = Math.Min(_watcherBackoffMs * 2, 60000);
+                Logger.Warn("Watcher: " + problem
+                    + "; tearing down and rebuilding pipeline from current config.");
+                try
+                {
+                    RestartPipeline();
+                    Logger.Info("Watcher: pipeline rebuild issued.");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex, "WatcherRebuild");
+                }
+                lastFrames = Interlocked.Read(ref _framesSent);
+                lastIter = Interlocked.Read(ref _capIterations);
+                // This instance exits; RestartPipeline -> Start() launched a fresh
+                // watcher. (If the rebuild failed to relight, the 5s retry timer
+                // calls Start() again, which restarts this watcher too.)
+                return;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error(ex, "Watcher");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Single watcher health check. Returns a human-readable problem, or null when
+    /// the pipeline looks healthy. Updates the caller's baseline counters.
+    /// A long-idle (static) screen also yields no frames; that only triggers a
+    /// rebuild after 30s of total silence, and the rebuild is harmless (same
+    /// source name — receivers re-sync), matching the existing 5s Watchdog
+    /// philosophy while being far gentler.
+    /// </summary>
+    private string? DetectPipelineProblem(ref long lastFrames, ref long lastIter)
+    {
+        long now = Environment.TickCount64;
+
+        // Grace period after (re)start while threads spin up and frames start flowing.
+        if (now - _pipelineStartTick < 10000)
+        {
+            lastFrames = Interlocked.Read(ref _framesSent);
+            lastIter = Interlocked.Read(ref _capIterations);
+            return null;
+        }
+
+        bool capAlive = _capThread?.IsAlive == true;
+        bool sendAlive = _sendThread?.IsAlive == true;
+        if (!capAlive || !sendAlive)
+        {
+            return "worker thread died (capture alive=" + capAlive
+                + ", send alive=" + sendAlive + ")";
+        }
+
+        if (_capErrors >= 8)
+        {
+            return "capture erroring repeatedly (" + _capErrors + " consecutive)";
+        }
+        if (_sendErrors >= 8)
+        {
+            return "send erroring repeatedly (" + _sendErrors + " consecutive)";
+        }
+
+        long frames = Interlocked.Read(ref _framesSent);
+        long iter = Interlocked.Read(ref _capIterations);
+        bool iterStalled = iter == lastIter;
+        lastFrames = frames;
+        lastIter = iter;
+
+        // Iterations advance on every capture-loop pass (even DXGI timeouts on a
+        // static screen), so a flat counter with no errors means the loop is
+        // blocked inside a native call — a deadlock no retry counter can see.
+        if (iterStalled && _capErrors == 0)
+        {
+            return "capture loop stalled (no iterations in 2s+, no errors)";
+        }
+
+        long lastBeat = Math.Max(_lastSendTick, _lastCaptureTick);
+        if (now - lastBeat > 30000 && _capErrors == 0 && _sendErrors == 0)
+        {
+            return "no frames flowing for 30s+ (framesSent=" + frames + ")";
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Called by Program's global exception handlers: log the fatal, then rebuild
+    /// the pipeline on the UI thread instead of dying. Never throws, never rethrows.
+    /// </summary>
+    public void RecoverFromFatal(string context, Exception ex)
+    {
+        try
+        {
+            Logger.Error(ex, context + " (recovering: rebuilding pipeline)");
+        }
+        catch
+        {
+            // Never throw.
+        }
+
+        try
+        {
+            if (_ui != null)
+            {
+                _ui.Post(_ =>
+                {
+                    try { RestartPipeline(); }
+                    catch (Exception inner) { Logger.Error(inner, "RecoverRestart"); }
+                }, null);
+            }
+            else
+            {
+                try { RestartPipeline(); }
+                catch (Exception inner) { Logger.Error(inner, "RecoverRestart"); }
+            }
+        }
+        catch
+        {
+            // Never throw.
+        }
+    }
+
+    /// <summary>Log the first loop error immediately, then at most once per 30s.</summary>
+    private static void LogThrottled(ref long lastLogTick, ref int counter, Exception ex, string ctx)
+    {
+        try
+        {
+            counter++;
+            long now = Environment.TickCount64;
+            if (counter == 1 || now - lastLogTick >= 30000)
+            {
+                lastLogTick = now;
+                Logger.Error(ex, ctx + " (occurrence #" + counter + "; repeats throttled)");
+            }
+        }
+        catch
+        {
+            // Never throw.
+        }
+    }
+
+    /// <summary>Capped backoff for the capture/send loops: 500ms doubling to 8s max.</summary>
+    private static int LoopBackoff(int consecutiveErrors)
+    {
+        try
+        {
+            return Math.Min(500 * (1 << Math.Min(consecutiveErrors, 4)), 8000);
+        }
+        catch
+        {
+            return 2000;
+        }
+    }
+
     /// <summary>Mark the pipeline as errored: red-tinted tray icon + reason in the status header.</summary>
     private void Fail(string reason)
     {
@@ -336,14 +662,21 @@ public sealed class TrayContext : ApplicationContext
         {
             try
             {
+                Interlocked.Increment(ref _capIterations);
                 if (_dup == null)
                 {
                     try { _dup = new DesktopDuplicator(_cfg.DisplayDeviceName, _cfg.HideCursor); }
                     catch (Exception ex) when (ex is TypeLoadException || ex is FileNotFoundException || ex is DllNotFoundException)
-                    { Logger.Error(ex, "Capture unavailable (GDI fallback)"); Thread.Sleep(2000); continue; }
+                    {
+                        LogThrottled(ref _lastCaptureErrorLogTick, ref _captureErrorCount, ex, "Capture unavailable");
+                        Thread.Sleep(LoopBackoff(_capErrors++));
+                        continue;
+                    }
                 }
                 if (_dup!.TryGetFrame(out var frame) && frame != null)
                 {
+                    _capErrors = 0;
+                    _lastCaptureTick = Environment.TickCount64;
                     lock (_gate) { _slot = frame; _slotSeq++; }
                     _watchdog?.Beat();
                 }
@@ -351,9 +684,9 @@ public sealed class TrayContext : ApplicationContext
             }
             catch (Exception ex)
             {
-                Logger.Error(ex, "Capture");
+                LogThrottled(ref _lastCaptureErrorLogTick, ref _captureErrorCount, ex, "Capture");
                 try { _dup?.Dispose(); } catch { } _dup = null;
-                Thread.Sleep(500);
+                Thread.Sleep(LoopBackoff(_capErrors++));
             }
         }
     }
@@ -363,31 +696,49 @@ public sealed class TrayContext : ApplicationContext
         int next = Environment.TickCount;
         while (!_stop)
         {
-            if (_restartRequested) { _restartRequested = false; RestartPipeline(); return; }
-            int interval = 1000 / Math.Clamp(_cfg.Fps, 5, 60);
-            CapturedFrame? f = null;
-            lock (_gate)
+            try
             {
-                if (_slot != null && _slotSeq != _sentSeq) { f = _slot; _sentSeq = _slotSeq; }
-            }
-            if (f != null)
-            {
-                try
+                if (_restartRequested) { _restartRequested = false; RestartPipeline(); return; }
+                int interval = 1000 / Math.Clamp(_cfg.Fps, 5, 60);
+                CapturedFrame? f = null;
+                lock (_gate)
                 {
-                    _sender?.Send(_cfg.Scale < 0.99 ? Downscale(f, _cfg.Scale) : f);
-                    _watchdog?.Beat();
-                    NoteSentFrame();
+                    if (_slot != null && _slotSeq != _sentSeq) { f = _slot; _sentSeq = _slotSeq; }
                 }
-                catch (Exception ex) { Logger.Error(ex, "Send"); }
+                if (f != null)
+                {
+                    try
+                    {
+                        _sender?.Send(_cfg.Scale < 0.99 ? Downscale(f, _cfg.Scale) : f);
+                        _watchdog?.Beat();
+                        NoteSentFrame();
+                    }
+                    catch (Exception ex)
+                    {
+                        LogThrottled(ref _lastSendErrorLogTick, ref _sendErrorCount, ex, "Send");
+                        Thread.Sleep(LoopBackoff(_sendErrors++));
+                    }
+                }
+                next += interval;
+                int d = next - Environment.TickCount;
+                if (d > 0) Thread.Sleep(d); else next = Environment.TickCount;
             }
-            next += interval;
-            int d = next - Environment.TickCount;
-            if (d > 0) Thread.Sleep(d); else next = Environment.TickCount;
+            catch (Exception ex)
+            {
+                // Never let the send loop die: log throttled, back off, keep going.
+                LogThrottled(ref _lastSendErrorLogTick, ref _sendErrorCount, ex, "SendLoop");
+                Thread.Sleep(LoopBackoff(_sendErrors++));
+                next = Environment.TickCount;
+            }
         }
     }
 
     private void NoteSentFrame()
     {
+        // Success marker for the watcher thread: frames flowing + when.
+        Interlocked.Increment(ref _framesSent);
+        _lastSendTick = Environment.TickCount64;
+        _sendErrors = 0;
         _fpsCounter++;
         int t = Environment.TickCount;
         int dt = t - _fpsWindowTick;
@@ -460,6 +811,9 @@ public sealed class TrayContext : ApplicationContext
 
     private void Quit()
     {
+        _quit = true;
+        try { _retryTimer?.Dispose(); } catch { } _retryTimer = null;
+        try { _heartbeat?.Stop(); } catch { } _heartbeat = null;
         try
         {
             _blink.Stop();

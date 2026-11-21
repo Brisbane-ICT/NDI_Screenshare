@@ -10,7 +10,7 @@
     <SelfContained>false</SelfContained>
     <RootNamespace>NdiScreenshare</RootNamespace>
     <AssemblyName>NDI_Screenshare</AssemblyName>
-    <Version>0.1.1</Version>
+    <Version>0.1.2</Version>
   </PropertyGroup>
 
   <ItemGroup>

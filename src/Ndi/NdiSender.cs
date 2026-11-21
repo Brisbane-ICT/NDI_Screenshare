@@ -43,7 +43,11 @@ namespace NdiScreenshare.Ndi
         private const int MaxConsecutiveErrors = 10;
 
         // ---- Native send-create settings (NDIlib_send_create_t) ----
-        [StructLayout(LayoutKind.Sequential)]
+        // Verified against Processing.NDI.structs.h (NDI 6 SDK): const char* p_ndi_name,
+        // const char* p_groups, bool clock_video, bool clock_audio. C bool is 1 byte,
+        // matching [MarshalAs(UnmanagedType.I1)]. Pack=8 matches the MSVC default
+        // (/Zp8) used to build Processing.NDI.Lib.x64.dll.
+        [StructLayout(LayoutKind.Sequential, Pack = 8)]
         private struct NdiSendCreate
         {
             public IntPtr p_ndi_name; // const char* (UTF-8), null-terminated
@@ -55,7 +59,22 @@ namespace NdiScreenshare.Ndi
         }
 
         // ---- Native video frame (NDIlib_video_frame_v2_t) ----
-        [StructLayout(LayoutKind.Sequential)]
+        // Layout verified field-by-field against Processing.NDI.structs.h (NDI 6 SDK):
+        //   int xres, yres; NDIlib_FourCC_video_type_e FourCC (32-bit enum -> int);
+        //   int frame_rate_N, frame_rate_D; float picture_aspect_ratio;
+        //   NDIlib_frame_format_type_e frame_format_type (32-bit enum -> int);
+        //   int64_t timecode; uint8_t* p_data;
+        //   union { int line_stride_in_bytes; int data_size_in_bytes; };
+        //   const char* p_metadata; int64_t timestamp.
+        // Pack=8 matches the MSVC default (/Zp8) the NDI DLL is built with, so the
+        // implicit padding before the 8-byte fields (timecode, p_data, p_metadata,
+        // timestamp) matches the native layout exactly (total 72 bytes on x64).
+        // Constant cross-checks: FourCC BGRA = NDI_LIB_FOURCC('B','G','R','A')
+        //   = 0x41524742; progressive = NDIlib_frame_format_type_progressive = 1;
+        //   synthesize = NDIlib_send_timecode_synthesize = INT64_MAX.
+        // Header note: picture_aspect_ratio 0 means square pixels (valid), but we
+        // pass the explicit (float)xres/yres ratio so no receiver can misread it.
+        [StructLayout(LayoutKind.Sequential, Pack = 8)]
         private struct NdiVideoFrameV2
         {
             public int xres;
@@ -108,8 +127,13 @@ namespace NdiScreenshare.Ndi
         private static NdiDestroyDelegate s_destroy;
         private static NdiSendCreateDelegate s_sendCreate;
         private static NdiSendDestroyDelegate s_sendDestroy;
-        private static NdiSendVideoDelegate s_sendVideoAsync;
-        private static NdiSendVideoDelegate s_sendVideoV3;
+        // NOTE: synchronous NDIlib_send_send_video_v2 is the ONLY send path (see Send).
+        // The async export is deliberately not resolved: NDIlib_send_send_video_async_v2
+        // keeps referencing the caller's buffer after it returns, which caused a fatal
+        // native access violation (c0000005 in Processing.NDI.Lib.x64.dll) once the GC
+        // moved/freed the unpinned buffer. Sync copies before returning, so the buffer
+        // only needs to live for the duration of the call, which the GCHandle pin below
+        // already guarantees. v3 is not resolved either: it needs a larger frame struct.
         private static NdiSendVideoDelegate s_sendVideoV2;
         private static string s_versionString;
 
@@ -319,8 +343,17 @@ namespace NdiScreenshare.Ndi
                         return;
                     }
 
-                    // Prefer async send when the runtime exports it, else sync (v3, then v2).
-                    sendFn = s_sendVideoAsync ?? s_sendVideoV3 ?? s_sendVideoV2;
+                    // Synchronous send ONLY. The async variant
+                    // (NDIlib_send_send_video_async_v2) does NOT copy the frame: per
+                    // Processing.NDI.Send.h, "the memory accessed ... cannot be freed or
+                    // re-used by the caller until a synchronizing event has occurred".
+                    // Unpinning/freeing the buffer in the finally below would hand NDI a
+                    // buffer the GC may then move or collect while NDI is still reading
+                    // it -> intermittent native access violation (c0000005), uncatchable
+                    // from managed code, killing the process ~1 min after start.
+                    // NDIlib_send_send_video_v2 copies synchronously before returning,
+                    // so the GCHandle pin held for the duration of this call is enough.
+                    sendFn = s_sendVideoV2;
                     if (sendFn == null)
                     {
                         return;
@@ -342,7 +375,8 @@ namespace NdiScreenshare.Ndi
                         FourCC = FourCC_BGRA,
                         frame_rate_N = fps * 1000,
                         frame_rate_D = 1000,
-                        picture_aspect_ratio = 0f,
+                        // Explicit ratio (header: 0 = square pixels, also valid).
+                        picture_aspect_ratio = (float)width / (float)height,
                         frame_format_type = FrameFormatProgressive,
                         timecode = TimecodeSynthesize,
                         p_data = pinned.AddrOfPinnedObject(),
@@ -1067,7 +1101,7 @@ namespace NdiScreenshare.Ndi
             if (s_delegatesResolved)
             {
                 return s_sendCreate != null && s_sendDestroy != null && s_initialize != null
-                    && (s_sendVideoAsync != null || s_sendVideoV3 != null || s_sendVideoV2 != null);
+                    && s_sendVideoV2 != null;
             }
 
             lock (s_loadLock)
@@ -1075,7 +1109,7 @@ namespace NdiScreenshare.Ndi
                 if (s_delegatesResolved)
                 {
                     return s_sendCreate != null && s_sendDestroy != null && s_initialize != null
-                        && (s_sendVideoAsync != null || s_sendVideoV3 != null || s_sendVideoV2 != null);
+                        && s_sendVideoV2 != null;
                 }
 
                 IntPtr module = EnsureLoaded();
@@ -1092,13 +1126,11 @@ namespace NdiScreenshare.Ndi
                 s_sendCreate = GetFunction<NdiSendCreateDelegate>(module, "NDIlib_send_create");
                 s_sendDestroy = GetFunction<NdiSendDestroyDelegate>(module, "NDIlib_send_destroy");
 
-                // Video send: async preferred, then v3, then v2 (any may be absent per SDK version).
-                // NDI 6 frame structs grew (v3/v4); we keep the v2 struct and prefer whichever
-                // entry point exists, logging each lookup so app.log shows the outcome.
-                s_sendVideoAsync = GetFunction<NdiSendVideoDelegate>(module, "NDIlib_send_send_video_async_v2");
-                s_sendVideoV3 = GetFunction<NdiSendVideoDelegate>(module, "NDIlib_send_send_video_v3");
+                // Video send: synchronous NDIlib_send_send_video_v2 ONLY. The async
+                // variant is intentionally never resolved (see the field comment and
+                // Send): it outlives the caller's buffer and caused fatal native AVs.
                 s_sendVideoV2 = GetFunction<NdiSendVideoDelegate>(module, "NDIlib_send_send_video_v2");
-
+                // v3 is not resolved either (needs a larger frame struct than v2).
                 // 8th lookup: version string (diagnostic only, never required).
                 NdiVersionDelegate verFn = GetFunction<NdiVersionDelegate>(module, "NDIlib_version");
                 if (verFn != null)
@@ -1133,14 +1165,12 @@ namespace NdiScreenshare.Ndi
 
                 s_delegatesResolved = true;
 
-                string selected = s_sendVideoAsync != null ? "async_v2"
-                    : s_sendVideoV3 != null ? "v3"
-                    : s_sendVideoV2 != null ? "v2" : "(none)";
+                string selected = s_sendVideoV2 != null ? "v2-sync-only" : "(none)";
                 NdiLog("INFO", "Exports resolved from '" + s_loadedPath + "': selected_send=" + selected
                     + " diag=" + GetDiagnostics());
 
                 return s_initialize != null && s_sendCreate != null && s_sendDestroy != null
-                    && (s_sendVideoAsync != null || s_sendVideoV3 != null || s_sendVideoV2 != null);
+                    && s_sendVideoV2 != null;
             }
         }
 

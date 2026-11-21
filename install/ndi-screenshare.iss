@@ -46,6 +46,9 @@ Name: "autostart"; Description: "Start {#MyAppName} automatically when I log on"
 ; Framework-dependent single-file publish output (built by build-installer.ps1).
 Source: "..\dist\publish\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\publish\*"; DestDir: "{app}"; Excludes: "{#MyAppExe}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Out-of-process never-stop supervisor (per-user scheduled tasks + hang watchdog).
+Source: "..\install\setup-supervisor.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\install\check-heartbeat.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
@@ -58,6 +61,16 @@ Root: HKCU; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; Never-stop supervisor (per-user, silent-safe): registers the "NDI Screenshare"
+; logon task (restart-on-failure every 1 min) and the "NDI Screenshare Heartbeat"
+; hang-watchdog task. Runs hidden in all modes (including silent installs — there
+; is no skipifsilent here on purpose) and always exits 0, so setup can never fail
+; because of it. See install/setup-supervisor.ps1 for the full recovery story.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\setup-supervisor.ps1"" -ExePath ""{app}\{#MyAppExe}"""; Flags: runhidden waituntilterminated; StatusMsg: "Setting up auto-restart supervisor..."
+
+[UninstallRun]
+; Remove the supervisor tasks on uninstall (runs before {app} files are deleted).
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\setup-supervisor.ps1"" -Unregister"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveSupervisorTasks"
 
 [Code]
 function NdiEnvFilePresent(): Boolean;

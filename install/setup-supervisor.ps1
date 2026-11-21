@@ -123,7 +123,7 @@ try {
   # --- Task 1: launch at logon, restart 1 min after any failure (crash = non-zero exit). ---
   $action1 = New-ScheduledTaskAction -Execute $exe
   $trigger1 = New-ScheduledTaskTrigger -AtLogOn -User $user
-  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel LeastPrivilege
+  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
   $settings1 = New-ScheduledTaskSettingsSet `
     -RestartCount 9999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
@@ -142,7 +142,7 @@ try {
       -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$checker`""
     $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date) `
       -RepetitionInterval (New-TimeSpan -Minutes 1) `
-      -RepetitionDuration ([TimeSpan]::MaxValue)
+      -RepetitionDuration (New-TimeSpan -Days 3650)
     $settings2 = New-ScheduledTaskSettingsSet `
       -StartWhenAvailable `
       -AllowStartIfOnBatteries `

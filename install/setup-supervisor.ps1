@@ -137,9 +137,18 @@ try {
   Write-SupLog "Registered task '$TaskName' (logon trigger, restart-on-failure 1min x9999) -> $exe"
 
   # --- Task 2: hang watchdog, every minute forever. ---
-  if ($checker -and (Test-Path $checker)) {
-    $action2 = New-ScheduledTaskAction -Execute 'powershell.exe' `
-      -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$checker`""
+  # Launched via wscript + launch-hidden.vbs (windowless): running
+  # powershell.exe directly from Task Scheduler flashes a console
+  # window every minute, which users rightly hate.
+  $launcher = $null
+  try { $launcher = Join-Path $PSScriptRoot 'launch-hidden.vbs' } catch { }
+  if ((-not $launcher -or -not (Test-Path $launcher)) -and $checker) {
+    $alt = Join-Path (Split-Path $checker -Parent) 'launch-hidden.vbs'
+    if (Test-Path $alt) { $launcher = $alt }
+  }
+  if ($checker -and (Test-Path $checker) -and $launcher -and (Test-Path $launcher)) {
+    $action2 = New-ScheduledTaskAction -Execute 'wscript.exe' `
+      -Argument "//B //Nologo `"$launcher`""
     $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date) `
       -RepetitionInterval (New-TimeSpan -Minutes 1) `
       -RepetitionDuration (New-TimeSpan -Days 3650)

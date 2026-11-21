@@ -49,6 +49,7 @@ Source: "..\dist\publish\*"; DestDir: "{app}"; Excludes: "{#MyAppExe}"; Flags: i
 ; Out-of-process never-stop supervisor (per-user scheduled tasks + hang watchdog).
 Source: "..\install\setup-supervisor.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\install\check-heartbeat.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\install\launch-hidden.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"

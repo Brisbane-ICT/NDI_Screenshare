@@ -14,6 +14,29 @@ public sealed class TrayContext : ApplicationContext
     /// <summary>Visual state of the tray icon + status header.</summary>
     private enum TrayState { Stopped, Live, Error }
 
+    /// <summary>
+    /// App version read from the assembly at runtime (stamped from the repo VERSION
+    /// file at build time), never hardcoded here so version bumps show up automatically.
+    /// </summary>
+    private static readonly string AppVersion = GetAppVersion();
+
+    private static string GetAppVersion()
+    {
+        try
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            // Prefer InformationalVersion (exact SemVer); strip any "+gitsha" build metadata.
+            var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(info))
+            {
+                int plus = info.IndexOf('+');
+                return (plus >= 0 ? info[..plus] : info).Trim();
+            }
+            return asm.GetName().Version?.ToString(3) ?? "dev";
+        }
+        catch { return "dev"; }
+    }
+
     private readonly NotifyIcon _icon = new();
     private readonly ContextMenuStrip _menu = new();
     private readonly AppConfig _cfg = AppConfig.Load();
@@ -24,6 +47,7 @@ public sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _status2 = new() { Enabled = false };
     private readonly ToolStripMenuItem _displays = new("Displays");
     private readonly ToolStripMenuItem _auto = new("Start with Windows");
+    private readonly ToolStripMenuItem _versionItem = new() { Enabled = false };
     private readonly System.Windows.Forms.Timer _blink = new() { Interval = 750 };
     private readonly object _gate = new();
     private readonly Dictionary<(TrayState, bool), Icon> _icons = new();
@@ -108,7 +132,9 @@ public sealed class TrayContext : ApplicationContext
 
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => Quit();
+        _versionItem.Text = $"NDI Screenshare v{AppVersion}";
         _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(_versionItem);
         _menu.Items.Add(exit);
 
         _toggle.Click += (_, _) => { _cfg.Running = !_cfg.Running; _cfg.Save(); if (_cfg.Running) Start(); else Stop(); SyncMenu(); };
@@ -196,6 +222,9 @@ public sealed class TrayContext : ApplicationContext
             TrayState.Error => $"NDI Screenshare — ERROR: {_errorReason ?? "see menu"}",
             _ => "NDI Screenshare (stopped)",
         };
+        // Hover tooltip always carries the version too (shell truncates past ~63 chars).
+        if (!_icon.Text.EndsWith($" v{AppVersion}", StringComparison.Ordinal))
+            _icon.Text += $" · v{AppVersion}";
 
         // Blink the live icon; hold steady for stopped/error so the tint reads clearly.
         bool blink = _state == TrayState.Live;

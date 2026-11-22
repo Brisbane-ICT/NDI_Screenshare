@@ -1,4 +1,5 @@
 using NdiScreenshare.Infra;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace NdiScreenshare;
@@ -18,6 +19,28 @@ internal static class Program
 
     [DllImport("kernel32", SetLastError = true)]
     private static extern int UnregisterApplicationRestart();
+
+    // Mutual supervision: the invisible Supervisor.exe watches the feed from
+    // outside the process (it survives native crashes that kill us instantly).
+    // It is a WinExe like us — starting it can never flash a console.
+    // Best effort: the feed must start even if the supervisor is absent.
+    private static void EnsureSupervisor()
+    {
+        try
+        {
+            if (Process.GetProcessesByName("Supervisor").Length > 0) return;
+            string sup = Path.Combine(AppContext.BaseDirectory, "Supervisor.exe");
+            if (!File.Exists(sup)) return;
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = sup,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+            });
+        }
+        catch { /* supervisor is a safety net, never a startup dependency */ }
+    }
 
     [STAThread]
     static void Main(string[] args)
@@ -76,6 +99,7 @@ internal static class Program
         };
         _mutex = new Mutex(true, "NDI_Screenshare_SingleInstance", out bool fresh);
         if (!fresh) return;
+        EnsureSupervisor();
         try
         {
             ApplicationConfiguration.Initialize();

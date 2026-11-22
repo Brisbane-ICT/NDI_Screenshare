@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <RootNamespace>NdiScreenshare.Supervisor</RootNamespace>
+    <AssemblyName>Supervisor</AssemblyName>
+    <Description>Invisible never-stop supervisor for NDI Screenshare. No windows, no console, ever.</Description>
+  </PropertyGroup>
+
+</Project>

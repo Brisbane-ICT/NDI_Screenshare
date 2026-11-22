@@ -47,7 +47,12 @@ if (-not $SkipPublish) {
     -c Release -r $Runtime --self-contained $scArg `
     /p:PublishSingleFile=true /p:Version=$version `
     -o $publishDir
-  if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit $LASTEXITCODE)" }
+  if ($LASTEXITCODE -ne 0) { throw "dotnet publish (TrayApp) failed (exit $LASTEXITCODE)" }
+  dotnet publish "$repoRoot\src\Supervisor\Supervisor.csproj" `
+    -c Release -r $Runtime --self-contained $scArg `
+    /p:PublishSingleFile=true /p:Version=$version `
+    -o $publishDir
+  if ($LASTEXITCODE -ne 0) { throw "dotnet publish (Supervisor) failed (exit $LASTEXITCODE)" }
   Write-Host "Published to $publishDir"
 } else {
   Write-Host "Skipping publish, reusing $publishDir"

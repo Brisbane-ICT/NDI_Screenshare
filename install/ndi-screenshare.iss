@@ -55,6 +55,10 @@ Source: "..\dist\publish\Supervisor.exe"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
 Name: "{autostartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: autostart
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
+; The supervisor always starts at logon (unconditional): it is a windowless
+; WinExe so it can never flash a console, and it starts the app itself within
+; seconds — this is the never-stop guarantee, no scheduled tasks involved.
+Name: "{autostartup}\{#MyAppName} Supervisor"; Filename: "{app}\Supervisor.exe"
 
 [Registry]
 ; Optional autostart via Run key (alternative to Startup shortcut above).
@@ -62,14 +66,17 @@ Root: HKCU; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
-; Never-stop supervisor: registers the logon tasks (app + supervisor + per-minute
-; hang check). Supervisor.exe is a windowless WinExe, so this runs hidden in all
-; modes including silent installs — there is no skipifsilent here on purpose —
-; and it always exits 0, so setup can never fail because of it.
+; Never-stop supervisor: ensures the watchdog loop is running right away (it
+; starts the app itself if needed). Supervisor.exe is a windowless WinExe, so
+; this runs hidden in all modes including silent installs — there is no
+; skipifsilent here on purpose — and it always exits 0, so setup can never
+; fail because of it. Logon persistence comes from the Startup shortcuts above,
+; not from scheduled tasks (which would need admin rights to manage).
 Filename: "{app}\Supervisor.exe"; Parameters: "--install"; Flags: runhidden waituntilterminated; StatusMsg: "Setting up auto-restart supervisor..."
 
 [UninstallRun]
-; Remove the supervisor tasks on uninstall (runs before {app} files are deleted).
+; Stop the supervisor loop (and the app) on uninstall. The Startup shortcuts
+; are removed automatically with the icons above.
 Filename: "{app}\Supervisor.exe"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveSupervisorTasks"
 
 [Code]

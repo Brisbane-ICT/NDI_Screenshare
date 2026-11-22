@@ -11,7 +11,7 @@
 //   Supervisor.exe --uninstall     stop loop/app, remove tasks, exit
 //
 // Tasks are registered through the Task Scheduler COM API (Schedule.Service)
-// so no schtasks.exe / powershell.exe / wscript.exe is ever involved —
+// so no schtasks.exe / powershell.exe / wscript.exe is ever involved â€”
 // launching those from Task Scheduler is what flashed console windows.
 // Every task action executes a WinExe binary, which can never show a window.
 
@@ -27,9 +27,6 @@ internal static class Program
     private const string AppProcessName = "NDI_Screenshare";
     private const string AppExeName = "NDI_Screenshare.exe";
     private const string SupervisorMutexName = "NDI_Screenshare_Supervisor_SingleInstance";
-    private const string TaskApp = "NDI Screenshare";
-    private const string TaskSupervisor = "NDI Screenshare Supervisor";
-    private const string TaskHeartbeat = "NDI Screenshare Heartbeat";
     private const int MaxHeartbeatAgeSeconds = 30;
     private const int NoHeartbeatGraceSeconds = 120;
 
@@ -138,21 +135,12 @@ internal static class Program
     {
         try
         {
-            string? exe = ResolveAppExe();
-            string? sup = ResolveOwnExe();
-            if (exe == null || sup == null)
-            {
-                SupLog("Install: could not resolve exe paths; tasks not registered.");
-                return;
-            }
-            string user = WindowsIdentity.GetCurrent().Name;
-            RegisterLogonTask(TaskApp, exe, "", "NDI Screenshare: start at logon; restart 1 min after any crash.");
-            RegisterLogonTask(TaskSupervisor, sup, "", "NDI Screenshare supervisor: keeps the feed alive; restart 1 min after any crash.");
-            RegisterHeartbeatTask(sup);
-            SupLog($"Install complete. app={exe} supervisor={sup}");
-            // Start the loop now so protection is immediate (no logoff needed).
-            // The loop starts the app itself if it is not running.
-            StartHidden(sup);
+            // No scheduled tasks, no COM, no CLI tools — persistence comes
+            // from Startup-folder shortcuts (windowless WinExe launches that
+            // can never flash a console and need no admin rights). Just make
+            // sure the loop is running; it starts the app itself in seconds.
+            StartLoopIfNeeded();
+            SupLog("Install complete (loop ensured; persistence via Startup shortcuts).");
         }
         catch (Exception ex) { SupLog("Install error: " + ex.Message); }
     }
@@ -163,90 +151,22 @@ internal static class Program
         {
             try { foreach (var p in Process.GetProcessesByName("Supervisor")) { try { if (p.Id != Environment.ProcessId) p.Kill(); } catch { } } } catch { }
             try { foreach (var p in Process.GetProcessesByName(AppProcessName)) { try { p.Kill(); } catch { } } } catch { }
-            DeleteTask(TaskHeartbeat);
-            DeleteTask(TaskSupervisor);
-            DeleteTask(TaskApp);
             SupLog("Uninstall complete.");
         }
         catch (Exception ex) { SupLog("Uninstall error: " + ex.Message); }
     }
 
-    // ---- Task Scheduler COM (no CLI tools) ----
-
-    private static object Scheduler()
-    {
-        Type? t = Type.GetTypeFromProgID("Schedule.Service");
-        if (t == null) throw new InvalidOperationException("Schedule.Service COM not available.");
-        dynamic svc = Activator.CreateInstance(t)!;
-        svc.Connect();
-        return svc;
-    }
-
-    private static void RegisterLogonTask(string name, string exePath, string args, string description)
-    {
-        dynamic svc = Scheduler();
-        dynamic root = svc.GetFolder("\\");
-        try { root.DeleteTask(name, 0); } catch { }
-        dynamic def = svc.NewTask(0);
-        def.RegistrationInfo.Description = description;
-        def.RegistrationInfo.Author = "NDI Screenshare";
-        dynamic trigger = def.Triggers.Create(9); // TASK_TRIGGER_LOGON
-        trigger.UserId = WindowsIdentity.GetCurrent().Name;
-        dynamic action = def.Actions.Create(0); // TASK_ACTION_EXEC
-        action.Path = exePath;
-        action.Arguments = args ?? "";
-        def.Settings.RestartCount = 9999;
-        def.Settings.RestartInterval = "PT1M";
-        def.Settings.StartWhenAvailable = true;
-        def.Settings.AllowStartIfOnBatteries = true;
-        def.Settings.DontStopIfGoingOnBatteries = true;
-        def.Settings.ExecutionTimeLimit = "PT0S";
-        def.Settings.MultipleInstances = 1; // ignore new instance while running
-        def.Principal.UserId = WindowsIdentity.GetCurrent().Name;
-        def.Principal.LogonType = 3; // TASK_LOGON_INTERACTIVE_TOKEN (per-user, no password)
-        def.Principal.RunLevel = 0; // least privilege
-        root.RegisterTaskDefinition(name, def, 6, null, null, 3, null); // 6 = CREATE_OR_UPDATE
-        SupLog($"Registered task '{name}' -> {exePath} {args}".Trim());
-    }
-
-    private static void RegisterHeartbeatTask(string supervisorExe)
-    {
-        dynamic svc = Scheduler();
-        dynamic root = svc.GetFolder("\\");
-        try { root.DeleteTask(TaskHeartbeat, 0); } catch { }
-        dynamic def = svc.NewTask(0);
-        def.RegistrationInfo.Description = "NDI Screenshare: single supervision pass every minute (windowless).";
-        def.RegistrationInfo.Author = "NDI Screenshare";
-        dynamic trigger = def.Triggers.Create(1); // TASK_TRIGGER_TIME
-        trigger.StartBoundary = DateTime.Now.AddMinutes(1).ToString("yyyy-MM-ddTHH:mm:ss");
-        trigger.Repetition.Interval = "PT1M";
-        trigger.Repetition.Duration = "P3650D";
-        trigger.Repetition.StopAtDurationEnd = false;
-        dynamic action = def.Actions.Create(0);
-        action.Path = supervisorExe;
-        action.Arguments = "--check-once";
-        def.Settings.StartWhenAvailable = true;
-        def.Settings.AllowStartIfOnBatteries = true;
-        def.Settings.DontStopIfGoingOnBatteries = true;
-        def.Settings.ExecutionTimeLimit = "PT5M";
-        def.Settings.MultipleInstances = 1;
-        def.Principal.UserId = WindowsIdentity.GetCurrent().Name;
-        def.Principal.LogonType = 3;
-        def.Principal.RunLevel = 0;
-        root.RegisterTaskDefinition(TaskHeartbeat, def, 6, null, null, 3, null);
-        SupLog($"Registered task '{TaskHeartbeat}' -> {supervisorExe} --check-once");
-    }
-
-    private static void DeleteTask(string name)
+    private static void StartLoopIfNeeded()
     {
         try
         {
-            dynamic svc = Scheduler();
-            dynamic root = svc.GetFolder("\\");
-            root.DeleteTask(name, 0);
-            SupLog($"Removed task '{name}'.");
+            // This --install process exits; the loop must live on in a copy.
+            if (Process.GetProcessesByName("Supervisor").Length > 1) return;
+            string? sup = ResolveOwnExe();
+            if (sup == null) { SupLog("Install: supervisor exe path unknown."); return; }
+            StartHidden(sup);
         }
-        catch { /* already gone */ }
+        catch (Exception ex) { SupLog("Install: loop start failed: " + ex.Message); }
     }
 
     // ---- Helpers (never throw outward) ----
@@ -337,3 +257,4 @@ internal static class Program
         catch { }
     }
 }
+

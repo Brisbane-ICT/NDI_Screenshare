@@ -60,12 +60,12 @@ internal static class Program
 
             if (checkOnce) { SuperviseOnce(); return 0; }
 
-            SupLog("Supervisor loop started.");
+            SupLog("Supervisor loop started (5s cadence).");
             while (true)
             {
                 try { SuperviseOnce(); }
                 catch (Exception ex) { SupLog("Loop error (continuing): " + ex.Message); }
-                Thread.Sleep(TimeSpan.FromSeconds(10));
+                Thread.Sleep(TimeSpan.FromSeconds(5));
             }
         }
         catch (Exception ex)

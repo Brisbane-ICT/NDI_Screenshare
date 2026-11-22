@@ -27,6 +27,17 @@ internal static class Program
     private const string AppProcessName = "NDI_Screenshare";
     private const string AppExeName = "NDI_Screenshare.exe";
     private const string SupervisorMutexName = "NDI_Screenshare_Supervisor_SingleInstance";
+    // Pre-0.1.7 installers registered root-folder scheduled tasks that ran
+    // powershell.exe every minute (the console flash). Root-folder tasks need
+    // admin rights to touch, so unelevated installs cannot remove them -
+    // deletion here is best-effort and succeeds on admin installs.
+    // 0.1.7+ creates NO scheduled tasks at all.
+    private static readonly string[] LegacyRootTasks = new[]
+    {
+        "NDI Screenshare",
+        "NDI Screenshare Supervisor",
+        "NDI Screenshare Heartbeat",
+    };
     private const int MaxHeartbeatAgeSeconds = 30;
     private const int NoHeartbeatGraceSeconds = 120;
 
@@ -140,6 +151,7 @@ internal static class Program
             // can never flash a console and need no admin rights). Just make
             // sure the loop is running; it starts the app itself in seconds.
             StartLoopIfNeeded();
+            DeleteLegacyRootTasks();
             SupLog("Install complete (loop ensured; persistence via Startup shortcuts).");
         }
         catch (Exception ex) { SupLog("Install error: " + ex.Message); }
@@ -151,6 +163,7 @@ internal static class Program
         {
             try { foreach (var p in Process.GetProcessesByName("Supervisor")) { try { if (p.Id != Environment.ProcessId) p.Kill(); } catch { } } } catch { }
             try { foreach (var p in Process.GetProcessesByName(AppProcessName)) { try { p.Kill(); } catch { } } } catch { }
+            DeleteLegacyRootTasks();
             SupLog("Uninstall complete.");
         }
         catch (Exception ex) { SupLog("Uninstall error: " + ex.Message); }
@@ -244,6 +257,26 @@ internal static class Program
             return true;
         }
         catch { return false; }
+    }
+
+    private static void DeleteLegacyRootTasks()
+    {
+        // Only DeleteTask is used here (proven to work via late-bound COM);
+        // task *registration* is deliberately not attempted anywhere.
+        try
+        {
+            Type? t = Type.GetTypeFromProgID("Schedule.Service");
+            if (t == null) return;
+            dynamic svc = Activator.CreateInstance(t)!;
+            svc.Connect();
+            dynamic root = svc.GetFolder("\\");
+            foreach (string name in LegacyRootTasks)
+            {
+                try { root.DeleteTask(name, 0); SupLog($"Removed legacy scheduled task '{name}'."); }
+                catch { /* needs elevation; an admin install cleans it */ }
+            }
+        }
+        catch (Exception ex) { SupLog("Legacy cleanup note: " + ex.Message); }
     }
 
     private static void SupLog(string msg)
